@@ -1,0 +1,13 @@
+{
+  "scripts": {
+    "chatgpt:launch": "node scripts/chatgpt-image.js launch",
+    "chatgpt:check": "node scripts/chatgpt-image.js check",
+    "chatgpt:image": "node scripts/chatgpt-image.js generate",
+    "chatgpt:text": "node scripts/chatgpt-text.js ask",
+    "chatgpt:text-check": "node scripts/chatgpt-text.js check"
+  },
+  "dependencies": {
+    "chrome-devtools-mcp": "^0.24.0",
+    "playwright": "^1.59.1"
+  }
+}

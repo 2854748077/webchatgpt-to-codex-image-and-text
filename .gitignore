@@ -1,0 +1,16 @@
+node_modules/
+output/
+.env
+.env.*
+*.log
+npm-debug.log*
+
+# Local browser automation data
+chrome-automation-profile/
+chrome-debug-profile/
+
+# OS/editor noise
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
