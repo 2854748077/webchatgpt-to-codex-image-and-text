@@ -1,18 +1,24 @@
 # Web ChatGPT to Codex Image and Text
 
-这个仓库提供一组本地自动化脚本，让 Codex 通过已登录的 Chrome ChatGPT 网页版完成：
+这个仓库提供一组本地自动化脚本，让 Codex 通过已登录的 Chrome ChatGPT 网页版完成图片生成、文本生成和视频素材流水线。
 
-- 图片生成、下载与质量验证。
-- 文本生成、保存到本地文件，并按规则复用同一个 ChatGPT 网页会话。
-- AI 视频项目素材流水线：分镜/关键帧图片目录准备、批量图片生成、质量报告、视频 prompt 输出。
-- Codex skill：`chatgpt-web-image`，用于让 Codex 优先调用这些本地脚本。
+## 功能概览
+
+- 通过 ChatGPT 网页版生成图片，自动下载到本地。
+- 支持纯文生图，也支持上传参考图后图文生图。
+- 图片下载成功后，自动把对应 ChatGPT 聊天移动到项目，方便集中清理。
+- 图片质量验证：尺寸、文件大小、清晰度、噪点。
+- 文本生成可选启用，默认不使用本地 ChatGPT 网页生成文本。
+- 文本生成默认复用同一个网页版聊天，除非你明确允许新建或重置。
+- AI 视频素材流水线：项目目录准备、关键帧图片生成、质量报告、视频 prompt 输出。
+- Codex skill：`chatgpt-web-image`。
 
 ## 环境要求
 
 - Windows
 - Node.js / npm
 - Google Chrome
-- 已在 Chrome 中登录 ChatGPT
+- Chrome 中已登录 ChatGPT
 
 安装依赖：
 
@@ -22,13 +28,13 @@ npm install
 
 ## Chrome 调试端口
 
-检查当前 Chrome 是否可被脚本接管：
+检查 Chrome 是否可被脚本接管：
 
 ```powershell
 npm run chatgpt:check
 ```
 
-如果不可用，启动一个带远程调试端口的 Chrome：
+如果不可用，启动带远程调试端口的 Chrome：
 
 ```powershell
 npm run chatgpt:launch
@@ -40,7 +46,7 @@ npm run chatgpt:launch
 node scripts\chatgpt-image.js launch --force-close
 ```
 
-默认 CDP 地址是：
+默认 CDP 地址：
 
 ```text
 http://127.0.0.1:9222
@@ -51,7 +57,7 @@ http://127.0.0.1:9222
 生成一张图片：
 
 ```powershell
-npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --project "LY" --new-chat --validate
+npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --new-chat --validate
 ```
 
 脚本会自动把图片提示词规范成：
@@ -60,29 +66,44 @@ npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --project
 生成照片：cat
 ```
 
-如果 ChatGPT 返回文字而不是图片，脚本会延时检测并尝试用更强的图片生成提示词重试。
+如果 ChatGPT 返回文字而不是图片，脚本会延时检测并尝试使用更强的图片生成提示词重试。
 
-图片聊天默认强制移动到 ChatGPT 项目，避免生成很多散落聊天。项目名策略：
+## 图片聊天项目归档
 
-1. 如果传了 `--project "项目名"`，只使用这个项目；不存在则创建这个项目。
-2. 如果设置了环境变量 `CHATGPT_IMAGE_PROJECT`，只使用这个项目；不存在则创建这个项目。
-3. 默认先找 `333`。
-4. 找不到 `333` 就找 `222`。
-5. `333` 和 `222` 都没有，就新建 `333`。
+只要是图片生成，不管是纯文生图还是图文生图，图片下载成功后都会把当前 ChatGPT 聊天移动到项目。
 
-如果项目不存在或移动失败，图片已经下载后脚本仍会退出失败。临时关闭项目移动：
+默认项目策略：
 
-```powershell
-node scripts\chatgpt-image.js generate --prompt "cat" --no-project
-```
+1. 先找 `333`。
+2. 找不到 `333` 就找 `222`。
+3. `333` 和 `222` 都不存在时，新建 `333`。
+4. 移动后会进入项目页验证当前聊天 `/c/...` 是否真的出现在项目里。
+5. 验证失败则脚本失败退出，避免“日志显示成功但实际没放进去”。
 
-也可以临时指定项目：
+临时指定项目：
 
 ```powershell
 node scripts\chatgpt-image.js generate --prompt "cat" --project "LY"
 ```
 
-可选上传参考图：
+通过环境变量指定默认项目：
+
+```powershell
+$env:CHATGPT_IMAGE_PROJECT="LY"
+node scripts\chatgpt-image.js generate --prompt "cat"
+```
+
+临时关闭项目移动：
+
+```powershell
+node scripts\chatgpt-image.js generate --prompt "cat" --no-project
+```
+
+注意：文本生成脚本不会默认移动到项目。
+
+## 参考图生成
+
+上传一张参考图：
 
 ```powershell
 node scripts\chatgpt-image.js generate `
@@ -110,7 +131,15 @@ node scripts\chatgpt-image.js generate --prompt "按参考图生成" --reference
 node scripts\chatgpt-image.js generate --prompt "按参考图生成" --references "D:\refs\list.txt"
 ```
 
-清单文件每行一个图片路径，支持空行和 `#` 注释。支持的图片类型：`png`、`jpg`、`jpeg`、`webp`、`gif`。
+清单文件每行一个图片路径，支持空行和 `#` 注释。
+
+支持的图片类型：
+
+```text
+png, jpg, jpeg, webp, gif
+```
+
+## 图片验证
 
 独立验证图片：
 
@@ -120,7 +149,7 @@ node scripts\chatgpt-image.js validate --image output\chatgpt-images\example.png
 
 ## 文本生成
 
-文本生成默认不是 Codex 的自动行为，只有你明确要求使用本地 ChatGPT 网页版生成文本时才调用。
+文本生成默认不是 Codex 的自动行为。只有你明确要求使用本地 ChatGPT 网页版生成文本时，才调用 `chatgpt-text.js`。
 
 第一次创建文本会话必须明确允许：
 
@@ -148,11 +177,12 @@ node scripts\chatgpt-text.js session open
 node scripts\chatgpt-text.js session clear
 ```
 
-脚本规则：
+文本脚本规则：
 
 - 没有保存的文本会话时，默认不自动新建。
 - 只有 `--allow-new-chat`、`--new-chat` 或 `--reset-session` 才允许创建或替换会话。
 - 已有会话时默认打开保存的 `/c/...` 聊天链接并继续使用。
+- 文本生成默认不移动到 ChatGPT 项目。
 
 ## AI 视频素材流水线
 
@@ -175,7 +205,7 @@ powershell -ExecutionPolicy Bypass -File scripts\ai-video-pipeline.ps1 -ProjectD
 
 ## Codex Skill
 
-Skill 文件在：
+Skill 文件：
 
 ```text
 skills/chatgpt-web-image/SKILL.md
@@ -200,7 +230,7 @@ npm run chatgpt:text -- --prompt "只回复 OK"
 npm run chatgpt:text-check
 ```
 
-## 注意
+## 注意事项
 
 - 这些脚本依赖 ChatGPT 网页 UI，ChatGPT 改版后可能需要调整选择器。
 - 脚本消耗的是你当前 ChatGPT 网页账号的可用能力。
