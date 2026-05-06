@@ -211,12 +211,14 @@ async function generateImage(options) {
 
       const attemptPrompt = buildAttemptPrompt(prompt, attempt);
       const baselineKeys = await collectImageKeys(page);
+      const baselineAssistantImages = await collectAssistantImageState(page);
       const baselineText = await collectPageText(page);
       console.log(`Prompt: ${attemptPrompt}`);
       await submitPrompt(page, attemptPrompt);
 
       try {
         const imageHandle = await waitForGeneratedImage(page, baselineKeys, timeoutMs, {
+          baselineAssistantImages,
           baselineText,
           textRetryDelayMs,
         });
@@ -483,6 +485,22 @@ async function collectImageKeys(page) {
       .map((img) => `${img.currentSrc || img.src}|${img.naturalWidth}x${img.naturalHeight}`)
       .filter(Boolean);
   });
+}
+
+async function collectAssistantImageState(page) {
+  return page.evaluate(() => {
+    const assistantNodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+    const keys = [];
+    for (const node of assistantNodes) {
+      for (const img of Array.from(node.querySelectorAll("img"))) {
+        const src = img.currentSrc || img.src || "";
+        const width = img.naturalWidth || img.width || 0;
+        const height = img.naturalHeight || img.height || 0;
+        if (src) keys.push(`${src}|${width}x${height}`);
+      }
+    }
+    return { count: assistantNodes.length, keys };
+  }).catch(() => ({ count: 0, keys: [] }));
 }
 
 async function collectPageText(page) {
@@ -834,12 +852,16 @@ async function waitForGeneratedImage(page, baselineKeys, timeoutMs, options = {}
   const deadline = Date.now() + timeoutMs;
   const startedAt = Date.now();
   const baselineText = options.baselineText || "";
+  const baselineAssistantImages = options.baselineAssistantImages || { count: 0, keys: [] };
   const textRetryDelayMs = Number(options.textRetryDelayMs || DEFAULT_TEXT_RETRY_DELAY_MS);
   let stableCandidate = null;
   let stableSince = 0;
 
   while (Date.now() < deadline) {
-    const candidates = await page.locator("img").evaluateAll((nodes, baseline) => {
+    const candidates = await page.locator("img").evaluateAll((nodes, payload) => {
+      const baseline = payload.baseline || [];
+      const assistantBaseline = payload.assistantBaseline || { count: 0, keys: [] };
+      const assistantNodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
       return nodes
         .map((node, index) => {
           const img = /** @type {HTMLImageElement} */ (node);
@@ -850,13 +872,33 @@ async function waitForGeneratedImage(page, baselineKeys, timeoutMs, options = {}
           const key = `${src}|${width}x${height}`;
           const rect = img.getBoundingClientRect();
           const visible = rect.width > 0 && rect.height > 0;
-          return { index, src, width, height, area, key, visible };
+          const assistant = img.closest('[data-message-author-role="assistant"]');
+          const assistantIndex = assistant ? assistantNodes.indexOf(assistant) : -1;
+          const inComposer = Boolean(img.closest("form, #prompt-textarea, [contenteditable='true']"));
+          const inSidebar = Boolean(img.closest("nav, aside"));
+          const alt = img.getAttribute("alt") || "";
+          const text = [
+            alt,
+            img.getAttribute("aria-label"),
+            img.getAttribute("title"),
+            img.closest("button") ? img.closest("button").getAttribute("aria-label") : "",
+          ].filter(Boolean).join(" ");
+          const isUploadedReference = /uploaded|attached|reference|已上传|上传的图片|附件|参考/i.test(text);
+          const isGeneratedImage = /generated|已生成|生成图片|生成的图片/i.test(text);
+          return { index, src, width, height, area, key, visible, assistantIndex, inComposer, inSidebar, isUploadedReference, isGeneratedImage };
         })
         .filter((item) => item.visible)
         .filter((item) => item.width >= 256 && item.height >= 256)
+        .filter((item) => !item.isUploadedReference)
+        .filter((item) => item.isGeneratedImage || item.assistantIndex >= 0)
+        .filter((item) => item.isGeneratedImage || item.assistantIndex >= assistantBaseline.count || !assistantBaseline.keys.includes(item.key))
+        .filter((item) => !item.inComposer && !item.inSidebar)
         .filter((item) => !baseline.includes(item.key))
-        .sort((a, b) => b.area - a.area);
-    }, baselineKeys).catch(async (error) => {
+        .sort((a, b) => Number(b.isGeneratedImage) - Number(a.isGeneratedImage) || b.area - a.area);
+    }, {
+      baseline: baselineKeys,
+      assistantBaseline: baselineAssistantImages,
+    }).catch(async (error) => {
       if (/Execution context was destroyed|Cannot find context|Target closed/i.test(String(error.message || error))) {
         await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
         return [];
