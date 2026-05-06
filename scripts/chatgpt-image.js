@@ -706,12 +706,21 @@ async function isUploadBusy(page) {
 
 async function moveCurrentChatToProject(page, projectPlan, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
+  const chatUrl = page.url();
+  const chatId = extractConversationId(chatUrl);
   await closeOpenMenus(page);
 
   await openMoveToProjectMenu(page, deadline);
   for (const projectName of projectPlan.candidates) {
-    if (await clickProjectMenuItem(page, projectName)) {
+    const result = await clickProjectMenuItem(page, projectName);
+    if (result.clicked) {
       await page.waitForTimeout(2000);
+      await verifyChatInProject(page, {
+        chatId,
+        projectName,
+        projectHref: result.href,
+        deadline,
+      });
       return projectName;
     }
   }
@@ -739,7 +748,9 @@ async function openMoveToProjectMenu(page, deadline) {
 }
 
 async function createProjectFromMoveMenu(page, projectName, deadline) {
-  const opened = await clickProjectMenuItem(page, "新项目") || await clickProjectMenuItem(page, "New project");
+  const openedResult = await clickProjectMenuItem(page, "新项目");
+  const openedFallback = openedResult.clicked ? openedResult : await clickProjectMenuItem(page, "New project");
+  const opened = openedFallback.clicked;
   if (!opened) {
     throw new Error(`Projects not found and could not open new project flow for: ${projectName}`);
   }
@@ -753,6 +764,11 @@ async function createProjectFromMoveMenu(page, projectName, deadline) {
   }, `Could not create ChatGPT project: ${projectName}`);
 
   await page.waitForTimeout(3000);
+}
+
+function extractConversationId(url) {
+  const match = String(url || "").match(/\/c\/([^/?#]+)/);
+  return match ? match[1] : "";
 }
 
 async function closeOpenMenus(page) {
@@ -792,22 +808,48 @@ async function clickMenuItemByText(page, labels, options = {}) {
 async function clickProjectMenuItem(page, projectName) {
   return page.evaluate((projectName) => {
     const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
-    const candidates = Array.from(document.querySelectorAll('[role="menuitem"], a, button'));
+    const candidates = Array.from(document.querySelectorAll('[role="menuitem"]'))
+      .map((element) => {
+        const rect = element.getBoundingClientRect();
+        return { element, rect };
+      })
+      .filter((item) => item.rect.width > 0 && item.rect.height > 0)
+      .filter((item) => item.rect.x > 250);
     const item = candidates.find((element) => {
+      const node = element.element;
       const text = normalize([
-        element.innerText,
-        element.textContent,
-        element.getAttribute("aria-label"),
-        element.getAttribute("title"),
+        node.innerText,
+        node.textContent,
+        node.getAttribute("aria-label"),
+        node.getAttribute("title"),
       ].filter(Boolean).join(" "));
       if (!text) return false;
       const tokens = Array.from(new Set(text.split(" ").filter(Boolean)));
       return text === projectName || tokens.includes(projectName) || text.includes(projectName);
     });
-    if (!item) return false;
-    item.click();
-    return true;
-  }, projectName).catch(() => false);
+    if (!item) return { clicked: false, href: "" };
+    const href = item.element.href || item.element.getAttribute("href") || "";
+    item.element.click();
+    return { clicked: true, href };
+  }, projectName).catch(() => ({ clicked: false, href: "" }));
+}
+
+async function verifyChatInProject(page, details) {
+  if (!details.chatId) {
+    throw new Error(`Cannot verify project move because current URL is not a conversation URL.`);
+  }
+  if (!details.projectHref) {
+    throw new Error(`Cannot verify project move because project link was not found: ${details.projectName}`);
+  }
+
+  const projectUrl = new URL(details.projectHref, page.url()).toString();
+  await page.goto(projectUrl, { waitUntil: "domcontentloaded", timeout: Math.max(1000, details.deadline - Date.now()) });
+  await waitUntil(details.deadline, async () => {
+    return page.evaluate((chatId) => {
+      return Array.from(document.querySelectorAll("a"))
+        .some((anchor) => String(anchor.href || "").includes(`/c/${chatId}`));
+    }, details.chatId).catch(() => false);
+  }, `Chat was not found in project after move: ${details.projectName}`);
 }
 
 async function fillProjectNameField(page, projectName) {
