@@ -62,11 +62,13 @@ npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --project
 
 如果 ChatGPT 返回文字而不是图片，脚本会延时检测并尝试用更强的图片生成提示词重试。
 
-图片聊天默认强制移动到 ChatGPT 项目，避免生成很多散落聊天。项目名优先级：
+图片聊天默认强制移动到 ChatGPT 项目，避免生成很多散落聊天。项目名策略：
 
-1. `--project "项目名"`
-2. 环境变量 `CHATGPT_IMAGE_PROJECT`
-3. 默认值 `Codex 图片生成`
+1. 如果传了 `--project "项目名"`，只使用这个项目；不存在则创建这个项目。
+2. 如果设置了环境变量 `CHATGPT_IMAGE_PROJECT`，只使用这个项目；不存在则创建这个项目。
+3. 默认先找 `333`。
+4. 找不到 `333` 就找 `222`。
+5. `333` 和 `222` 都没有，就新建 `333`。
 
 如果项目不存在或移动失败，图片已经下载后脚本仍会退出失败。临时关闭项目移动：
 
@@ -74,10 +76,10 @@ npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --project
 node scripts\chatgpt-image.js generate --prompt "cat" --no-project
 ```
 
-建议先在 ChatGPT 网页里创建一个固定项目，然后设置：
+也可以临时指定项目：
 
 ```powershell
-$env:CHATGPT_IMAGE_PROJECT="LY"
+node scripts\chatgpt-image.js generate --prompt "cat" --project "LY"
 ```
 
 可选上传参考图：

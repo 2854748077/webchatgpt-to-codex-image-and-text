@@ -15,7 +15,8 @@ const DEFAULT_TIMEOUT_MS = 8 * 60 * 1000;
 const IMAGE_PROMPT_PREFIX = "生成照片：";
 const DEFAULT_TEXT_RETRY_DELAY_MS = 60 * 1000;
 const DEFAULT_MAX_TEXT_RETRIES = 2;
-const DEFAULT_IMAGE_PROJECT = process.env.CHATGPT_IMAGE_PROJECT || "Codex 图片生成";
+const DEFAULT_IMAGE_PROJECT = "333";
+const FALLBACK_IMAGE_PROJECT = "222";
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
@@ -57,7 +58,7 @@ Usage:
   node scripts/chatgpt-image.js generate --prompt "your prompt" [--output ./output/chatgpt-images]
                                      [--timeout 480000] [--cdp-url http://127.0.0.1:9222] [--port 9222]
                                      [--reference ./ref.png] [--references ./refs.txt]
-                                     [--project "Codex 图片生成"] [--no-project]
+                                     [--project "333"] [--no-project]
                                      [--new-chat] [--validate]
 
 Examples:
@@ -66,7 +67,7 @@ Examples:
   node scripts/chatgpt-image.js check --cdp-url http://127.0.0.1:9222
   node scripts/chatgpt-image.js generate --prompt "A cinematic fox warrior, ultra detailed"
   node scripts/chatgpt-image.js generate --prompt "Use the uploaded image as reference" --reference .\\ref.png
-  node scripts/chatgpt-image.js generate --prompt "cat" --project "LY"
+  node scripts/chatgpt-image.js generate --prompt "cat" --project "333"
 
 Notes:
   1. "launch" starts your local Chrome with remote debugging enabled on port ${DEBUG_PORT}.
@@ -193,7 +194,7 @@ async function generateImage(options) {
   const maxTextRetries = Number(options["text-retries"] || DEFAULT_MAX_TEXT_RETRIES);
   const cdpUrl = resolveCdpUrl(options);
   const referencePaths = resolveReferencePaths(options);
-  const projectName = resolveImageProjectName(options);
+  const projectPlan = resolveImageProjectPlan(options);
   const projectTimeoutMs = Number(options["project-timeout"] || 60000);
 
   fs.mkdirSync(outputDir, { recursive: true });
@@ -236,9 +237,9 @@ async function generateImage(options) {
             throw new Error(`Generated image failed quality validation: ${result.failures.join("; ")}`);
           }
         }
-        if (projectName) {
-          await moveCurrentChatToProject(page, projectName, projectTimeoutMs);
-          console.log(`Moved chat to project: ${projectName}`);
+        if (projectPlan.enabled) {
+          const movedProject = await moveCurrentChatToProject(page, projectPlan, projectTimeoutMs);
+          console.log(`Moved chat to project: ${movedProject}`);
         }
         return;
       } catch (error) {
@@ -272,12 +273,27 @@ function buildAttemptPrompt(prompt, attempt) {
   return `${IMAGE_PROMPT_PREFIX}请直接生成一张图片，不要回复文字说明，不要询问，不要解释。画面内容：${content}`;
 }
 
-function resolveImageProjectName(options) {
-  if (options["no-project"]) return "";
-  if (typeof options.project === "string" && options.project.trim()) {
-    return options.project.trim();
+function resolveImageProjectPlan(options) {
+  if (options["no-project"]) {
+    return { enabled: false, candidates: [], createName: "" };
   }
-  return DEFAULT_IMAGE_PROJECT;
+
+  if (typeof options.project === "string" && options.project.trim()) {
+    const projectName = options.project.trim();
+    return { enabled: true, candidates: [projectName], createName: projectName };
+  }
+
+  const envProject = process.env.CHATGPT_IMAGE_PROJECT;
+  if (envProject && envProject.trim()) {
+    const projectName = envProject.trim();
+    return { enabled: true, candidates: [projectName], createName: projectName };
+  }
+
+  return {
+    enabled: true,
+    candidates: [DEFAULT_IMAGE_PROJECT, FALLBACK_IMAGE_PROJECT],
+    createName: DEFAULT_IMAGE_PROJECT,
+  };
 }
 
 function resolveReferencePaths(options) {
@@ -688,10 +704,27 @@ async function isUploadBusy(page) {
   }).catch(() => false);
 }
 
-async function moveCurrentChatToProject(page, projectName, timeoutMs) {
+async function moveCurrentChatToProject(page, projectPlan, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   await closeOpenMenus(page);
 
+  await openMoveToProjectMenu(page, deadline);
+  for (const projectName of projectPlan.candidates) {
+    if (await clickProjectMenuItem(page, projectName)) {
+      await page.waitForTimeout(2000);
+      return projectName;
+    }
+  }
+
+  if (!projectPlan.createName) {
+    throw new Error(`Project not found in ChatGPT project menu: ${projectPlan.candidates.join(", ")}`);
+  }
+
+  await createProjectFromMoveMenu(page, projectPlan.createName, deadline);
+  return projectPlan.createName;
+}
+
+async function openMoveToProjectMenu(page, deadline) {
   const optionsButton = page.locator('[data-testid="conversation-options-button"]').last();
   if (!await optionsButton.count()) {
     throw new Error("Could not find ChatGPT conversation options button.");
@@ -703,15 +736,23 @@ async function moveCurrentChatToProject(page, projectName, timeoutMs) {
   }, `Could not open "Move to project" menu.`);
 
   await page.waitForTimeout(500);
-  const clickedProject = await waitUntil(deadline, async () => {
-    return await clickProjectMenuItem(page, projectName);
-  }, `Project not found in ChatGPT project menu: ${projectName}`);
+}
 
-  if (!clickedProject) {
-    throw new Error(`Project not found in ChatGPT project menu: ${projectName}`);
+async function createProjectFromMoveMenu(page, projectName, deadline) {
+  const opened = await clickProjectMenuItem(page, "新项目") || await clickProjectMenuItem(page, "New project");
+  if (!opened) {
+    throw new Error(`Projects not found and could not open new project flow for: ${projectName}`);
   }
 
-  await page.waitForTimeout(2000);
+  await waitUntil(deadline, async () => {
+    return await fillProjectNameField(page, projectName);
+  }, `Could not find new project name field for: ${projectName}`);
+
+  await waitUntil(deadline, async () => {
+    return await clickMenuItemByText(page, ["Create project", "Create", "创建项目", "创建"], { click: true });
+  }, `Could not create ChatGPT project: ${projectName}`);
+
+  await page.waitForTimeout(3000);
 }
 
 async function closeOpenMenus(page) {
@@ -767,6 +808,19 @@ async function clickProjectMenuItem(page, projectName) {
     item.click();
     return true;
   }, projectName).catch(() => false);
+}
+
+async function fillProjectNameField(page, projectName) {
+  const input = await findVisibleElementHandle(page, 'input[type="text"], input:not([type]), textarea');
+  if (!input) return false;
+  const box = await input.boundingBox().catch(() => null);
+  if (!box || box.width <= 0 || box.height <= 0) return false;
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.keyboard.press("Control+A");
+  await page.keyboard.press("Backspace");
+  await page.keyboard.insertText(projectName);
+  await page.waitForTimeout(300);
+  return true;
 }
 
 async function submitPrompt(page, prompt) {

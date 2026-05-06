@@ -49,7 +49,8 @@ node D:\codeX\scripts\chatgpt-image.js generate `
 Project grouping is required by default for image chats:
 
 - Pass `--project "project name"` whenever the target project is known.
-- If omitted, the script uses `CHATGPT_IMAGE_PROJECT` or the built-in default `Codex 图片生成`.
+- If omitted, the script uses `CHATGPT_IMAGE_PROJECT` when set.
+- If no project is specified, the script first tries `333`, then `222`; if neither exists, it creates `333`.
 - Use `--no-project` only when the user explicitly wants to skip moving the image chat into a project.
 - Text generation remains opt-in and does not use project grouping by default.
 
