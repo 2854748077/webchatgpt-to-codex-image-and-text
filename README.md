@@ -62,6 +62,36 @@ npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --new-cha
 
 如果 ChatGPT 返回文字而不是图片，脚本会延时检测并尝试用更强的图片生成提示词重试。
 
+可选上传参考图：
+
+```powershell
+node scripts\chatgpt-image.js generate `
+  --prompt "参考上传图片的角色外观，生成电影感场景图" `
+  --reference "D:\refs\character.png" `
+  --output output\chatgpt-images `
+  --new-chat `
+  --validate
+```
+
+多个参考图可以重复传 `--reference`，脚本本身不设数量上限：
+
+```powershell
+node scripts\chatgpt-image.js generate `
+  --prompt "综合这些参考图，生成统一风格的关键帧" `
+  --reference "D:\refs\character.png" `
+  --reference "D:\refs\environment.png" `
+  --reference "D:\refs\style.webp"
+```
+
+也可以传目录或清单文件：
+
+```powershell
+node scripts\chatgpt-image.js generate --prompt "按参考图生成" --reference "D:\refs"
+node scripts\chatgpt-image.js generate --prompt "按参考图生成" --references "D:\refs\list.txt"
+```
+
+清单文件每行一个图片路径，支持空行和 `#` 注释。支持的图片类型：`png`、`jpg`、`jpeg`、`webp`、`gif`。
+
 独立验证图片：
 
 ```powershell

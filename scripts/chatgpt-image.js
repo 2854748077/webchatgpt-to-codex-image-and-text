@@ -55,6 +55,7 @@ Usage:
   node scripts/chatgpt-image.js validate --image ./output/chatgpt-images/example.png
   node scripts/chatgpt-image.js generate --prompt "your prompt" [--output ./output/chatgpt-images]
                                      [--timeout 480000] [--cdp-url http://127.0.0.1:9222] [--port 9222]
+                                     [--reference ./ref.png] [--references ./refs.txt]
                                      [--new-chat] [--validate]
 
 Examples:
@@ -62,6 +63,7 @@ Examples:
   node scripts/chatgpt-image.js check
   node scripts/chatgpt-image.js check --cdp-url http://127.0.0.1:9222
   node scripts/chatgpt-image.js generate --prompt "A cinematic fox warrior, ultra detailed"
+  node scripts/chatgpt-image.js generate --prompt "Use the uploaded image as reference" --reference .\\ref.png
 
 Notes:
   1. "launch" starts your local Chrome with remote debugging enabled on port ${DEBUG_PORT}.
@@ -88,7 +90,11 @@ function parseOptions(args) {
       continue;
     }
 
-    options[key] = next;
+    if (Object.prototype.hasOwnProperty.call(options, key)) {
+      options[key] = Array.isArray(options[key]) ? [...options[key], next] : [options[key], next];
+    } else {
+      options[key] = next;
+    }
     index += 1;
   }
   return options;
@@ -183,6 +189,7 @@ async function generateImage(options) {
   const textRetryDelayMs = Number(options["text-retry-delay"] || DEFAULT_TEXT_RETRY_DELAY_MS);
   const maxTextRetries = Number(options["text-retries"] || DEFAULT_MAX_TEXT_RETRIES);
   const cdpUrl = resolveCdpUrl(options);
+  const referencePaths = resolveReferencePaths(options);
 
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -197,6 +204,10 @@ async function generateImage(options) {
       }
       await ensureChatGptPage(page);
       await ensureReady(page, timeoutMs);
+      if (referencePaths.length > 0) {
+        await activateImageGenerationMode(page);
+        await uploadReferenceImages(page, referencePaths, timeoutMs);
+      }
 
       const attemptPrompt = buildAttemptPrompt(prompt, attempt);
       const baselineKeys = await collectImageKeys(page);
@@ -248,6 +259,75 @@ function buildAttemptPrompt(prompt, attempt) {
 
   const content = prompt.startsWith(IMAGE_PROMPT_PREFIX) ? prompt.slice(IMAGE_PROMPT_PREFIX.length) : prompt;
   return `${IMAGE_PROMPT_PREFIX}请直接生成一张图片，不要回复文字说明，不要询问，不要解释。画面内容：${content}`;
+}
+
+function resolveReferencePaths(options) {
+  const values = [];
+  appendOptionValues(values, options.reference);
+  appendOptionValues(values, options.references);
+  appendOptionValues(values, options["reference-file"]);
+  appendOptionValues(values, options["references-file"]);
+
+  const paths = [];
+  for (const value of values) {
+    const resolved = path.resolve(String(value));
+    if (!fs.existsSync(resolved)) {
+      throw new Error(`Reference image or list not found: ${resolved}`);
+    }
+
+    if (fs.statSync(resolved).isDirectory()) {
+      for (const file of fs.readdirSync(resolved)) {
+        const candidate = path.join(resolved, file);
+        if (fs.statSync(candidate).isFile() && isSupportedReferenceImage(candidate)) {
+          paths.push(candidate);
+        }
+      }
+      continue;
+    }
+
+    if (isReferenceListFile(resolved)) {
+      const baseDir = path.dirname(resolved);
+      const lines = fs.readFileSync(resolved, "utf8")
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line && !line.startsWith("#"));
+      for (const line of lines) {
+        const candidate = path.resolve(baseDir, line);
+        if (!fs.existsSync(candidate)) {
+          throw new Error(`Reference image listed in ${resolved} not found: ${candidate}`);
+        }
+        if (!fs.statSync(candidate).isFile() || !isSupportedReferenceImage(candidate)) {
+          throw new Error(`Unsupported reference image listed in ${resolved}: ${candidate}`);
+        }
+        paths.push(candidate);
+      }
+      continue;
+    }
+
+    if (!isSupportedReferenceImage(resolved)) {
+      throw new Error(`Unsupported reference image type: ${resolved}`);
+    }
+    paths.push(resolved);
+  }
+
+  return Array.from(new Set(paths));
+}
+
+function appendOptionValues(target, value) {
+  if (!value) return;
+  if (Array.isArray(value)) {
+    for (const item of value) appendOptionValues(target, item);
+    return;
+  }
+  target.push(value);
+}
+
+function isReferenceListFile(filePath) {
+  return [".txt", ".list"].includes(path.extname(filePath).toLowerCase());
+}
+
+function isSupportedReferenceImage(filePath) {
+  return [".png", ".jpg", ".jpeg", ".webp", ".gif"].includes(path.extname(filePath).toLowerCase());
 }
 
 async function checkDebugger(options) {
@@ -409,6 +489,170 @@ async function collectPageText(page) {
   return page.evaluate(() => document.body.innerText || "").catch(() => "");
 }
 
+async function uploadReferenceImages(page, referencePaths, timeoutMs) {
+  if (!referencePaths.length) return;
+
+  const before = await collectUploadState(page);
+  const input = await findFileInput(page);
+  if (input) {
+    await input.setInputFiles(referencePaths);
+  } else {
+    const chooser = await openFileChooser(page, timeoutMs);
+    await chooser.setFiles(referencePaths);
+  }
+
+  await waitForReferenceUploads(page, referencePaths, before, timeoutMs);
+  console.log(`Reference images uploaded: ${referencePaths.length}`);
+  for (const referencePath of referencePaths) {
+    console.log(`- ${referencePath}`);
+  }
+}
+
+async function findFileInput(page) {
+  const handles = [];
+  const selectors = [
+    'input#upload-photos[type="file"]',
+    'input#image-gen-action-modal-upload-photos[type="file"]',
+    'input[type="file"][accept*="image"]',
+    'input[type="file"]',
+  ];
+  for (const selector of selectors) {
+    for (const handle of await page.$$(selector)) {
+      if (!handles.includes(handle)) handles.push(handle);
+    }
+  }
+  for (const handle of handles) {
+    const acceptsImage = await handle.evaluate((input) => {
+      const accept = String(input.getAttribute("accept") || "").toLowerCase();
+      return !accept || accept.includes("image") || accept.includes(".png") || accept.includes(".jpg") || accept.includes(".jpeg") || accept.includes(".webp");
+    }).catch(() => false);
+    if (acceptsImage) return handle;
+    await handle.dispose().catch(() => {});
+  }
+  return null;
+}
+
+async function activateImageGenerationMode(page) {
+  const clicked = await page.evaluate(() => {
+    const imageLabel = String.fromCodePoint(0x751f, 0x6210, 0x56fe, 0x7247);
+    const imageShortLabel = String.fromCodePoint(0x56fe, 0x7247);
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const buttons = Array.from(document.querySelectorAll("button")).filter(visible);
+    const candidate = buttons.find((button) => {
+      const text = [
+        button.innerText,
+        button.textContent,
+        button.getAttribute("aria-label"),
+        button.getAttribute("data-testid"),
+        button.getAttribute("title"),
+      ].filter(Boolean).join(" ");
+      return text.includes(imageLabel) || text.includes(imageShortLabel) || /image|photo/i.test(text);
+    });
+    if (!candidate) return false;
+    candidate.click();
+    return true;
+  }).catch(() => false);
+
+  if (clicked) {
+    await page.waitForTimeout(1000);
+  }
+}
+
+async function openFileChooser(page, timeoutMs) {
+  const chooserPromise = page.waitForEvent("filechooser", { timeout: Math.min(timeoutMs, 30000) });
+  if (await clickUploadButton(page)) {
+    return chooserPromise;
+  }
+  throw new Error("Could not find ChatGPT upload button or file input for reference images.");
+}
+
+async function clickUploadButton(page) {
+  const selectors = [
+    '[data-testid="composer-plus-btn"]',
+    'button[data-testid*="plus"]',
+    'button[aria-label*="Attach"]',
+    'button[aria-label*="Upload"]',
+    'button[aria-label*="Add"]',
+    'button[aria-label*="添加"]',
+    'button[aria-label*="上传"]',
+    'button[aria-label*="附件"]',
+  ];
+
+  for (const selector of selectors) {
+    const button = page.locator(selector).last();
+    if (await button.count() && await button.isVisible().catch(() => false) && await button.isEnabled().catch(() => false)) {
+      await button.click();
+      return true;
+    }
+  }
+
+  return page.evaluate(() => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    };
+    const candidate = Array.from(document.querySelectorAll("button"))
+      .filter((button) => visible(button))
+      .filter((button) => !button.disabled && button.getAttribute("aria-disabled") !== "true")
+      .map((button) => {
+        const text = [
+          button.innerText,
+          button.textContent,
+          button.getAttribute("aria-label"),
+          button.getAttribute("data-testid"),
+          button.getAttribute("title"),
+        ].filter(Boolean).join(" ");
+        const rect = button.getBoundingClientRect();
+        return { button, text, rect };
+      })
+      .filter((item) => /attach|upload|add|plus|paperclip|添加|上传|附件|文件/i.test(item.text))
+      .sort((a, b) => (b.rect.y - a.rect.y) || (a.rect.x - b.rect.x))[0];
+    if (!candidate) return false;
+    candidate.button.click();
+    return true;
+  }).catch(() => false);
+}
+
+async function collectUploadState(page) {
+  return page.evaluate(() => {
+    const composer = document.querySelector("form") || document.body;
+    const text = composer.innerText || "";
+    const images = Array.from(composer.querySelectorAll("img"))
+      .map((img) => `${img.currentSrc || img.src}|${img.naturalWidth || img.width}x${img.naturalHeight || img.height}`)
+      .filter(Boolean);
+    const attachments = Array.from(composer.querySelectorAll('[data-testid*="attachment"], [data-testid*="file"], [aria-label*="Remove"], [aria-label*="移除"], [aria-label*="删除"]')).length;
+    return { text, images, attachments };
+  }).catch(() => ({ text: "", images: [], attachments: 0 }));
+}
+
+async function waitForReferenceUploads(page, referencePaths, before, timeoutMs) {
+  const deadline = Date.now() + Math.min(timeoutMs, 120000);
+  const fileNames = referencePaths.map((filePath) => path.basename(filePath).toLowerCase());
+  while (Date.now() < deadline) {
+    const state = await collectUploadState(page);
+    const imageIncrease = state.images.length >= before.images.length + referencePaths.length;
+    const attachmentIncrease = state.attachments >= before.attachments + referencePaths.length;
+    const visibleNames = fileNames.every((name) => state.text.toLowerCase().includes(name));
+    const busy = await isUploadBusy(page);
+    if ((imageIncrease || attachmentIncrease || visibleNames) && !busy) return;
+    await page.waitForTimeout(1000);
+  }
+
+  throw new Error(`Timed out waiting for ${referencePaths.length} reference image(s) to upload.`);
+}
+
+async function isUploadBusy(page) {
+  return page.evaluate(() => {
+    const text = document.body.innerText || "";
+    return /uploading|attaching|processing|上传中|正在上传|处理中/i.test(text);
+  }).catch(() => false);
+}
+
 async function submitPrompt(page, prompt) {
   const editable = page.locator('[contenteditable="true"][role="textbox"], [contenteditable="true"]').first();
   const textbox = page.locator('textarea').first();
@@ -504,7 +748,7 @@ async function clickSendButton(page) {
     'button[aria-label*="提交"]',
   ];
 
-  const deadline = Date.now() + 10000;
+  const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
     for (const selector of selectors) {
       const button = page.locator(selector).last();

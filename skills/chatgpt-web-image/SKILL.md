@@ -45,6 +45,25 @@ node D:\codeX\scripts\chatgpt-image.js generate `
   --new-chat
 ```
 
+Optionally upload reference images:
+
+```powershell
+node D:\codeX\scripts\chatgpt-image.js generate `
+  --prompt "use uploaded reference images for character and style consistency" `
+  --reference "D:\refs\character.png" `
+  --reference "D:\refs\style.webp" `
+  --output "output directory" `
+  --new-chat
+```
+
+Reference image rules:
+
+- `--reference` can be repeated.
+- `--reference` may point to one image or a directory of images.
+- `--references` may point to a `.txt` or `.list` file with one image path per line.
+- The script does not impose a maximum count; the ChatGPT web UI or account may still have practical upload limits.
+- Supported image extensions are `png`, `jpg`, `jpeg`, `webp`, and `gif`.
+
 For important outputs, validate after generation:
 
 ```powershell
@@ -56,6 +75,7 @@ The image script already handles:
 - inserting Chinese prompt text robustly
 - clicking the ChatGPT send button
 - detecting text-only replies and retrying with stronger image wording
+- uploading optional reference images before prompt submission
 - downloading generated images
 - validating dimensions, file size, sharpness, and noise
 
