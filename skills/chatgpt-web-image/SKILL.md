@@ -42,8 +42,16 @@ Generate one image:
 node D:\codeX\scripts\chatgpt-image.js generate `
   --prompt "image prompt" `
   --output "output directory" `
+  --project "project name" `
   --new-chat
 ```
+
+Project grouping is required by default for image chats:
+
+- Pass `--project "project name"` whenever the target project is known.
+- If omitted, the script uses `CHATGPT_IMAGE_PROJECT` or the built-in default `Codex 图片生成`.
+- Use `--no-project` only when the user explicitly wants to skip moving the image chat into a project.
+- Text generation remains opt-in and does not use project grouping by default.
 
 Optionally upload reference images:
 
@@ -53,6 +61,7 @@ node D:\codeX\scripts\chatgpt-image.js generate `
   --reference "D:\refs\character.png" `
   --reference "D:\refs\style.webp" `
   --output "output directory" `
+  --project "project name" `
   --new-chat
 ```
 
@@ -77,6 +86,7 @@ The image script already handles:
 - detecting text-only replies and retrying with stronger image wording
 - uploading optional reference images before prompt submission
 - downloading generated images
+- moving image chats into a ChatGPT project after successful download
 - validating dimensions, file size, sharpness, and noise
 
 ## Batch Video Asset Pipeline

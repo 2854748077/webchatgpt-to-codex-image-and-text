@@ -15,6 +15,7 @@ const DEFAULT_TIMEOUT_MS = 8 * 60 * 1000;
 const IMAGE_PROMPT_PREFIX = "生成照片：";
 const DEFAULT_TEXT_RETRY_DELAY_MS = 60 * 1000;
 const DEFAULT_MAX_TEXT_RETRIES = 2;
+const DEFAULT_IMAGE_PROJECT = process.env.CHATGPT_IMAGE_PROJECT || "Codex 图片生成";
 
 async function main() {
   const [command, ...args] = process.argv.slice(2);
@@ -56,6 +57,7 @@ Usage:
   node scripts/chatgpt-image.js generate --prompt "your prompt" [--output ./output/chatgpt-images]
                                      [--timeout 480000] [--cdp-url http://127.0.0.1:9222] [--port 9222]
                                      [--reference ./ref.png] [--references ./refs.txt]
+                                     [--project "Codex 图片生成"] [--no-project]
                                      [--new-chat] [--validate]
 
 Examples:
@@ -64,6 +66,7 @@ Examples:
   node scripts/chatgpt-image.js check --cdp-url http://127.0.0.1:9222
   node scripts/chatgpt-image.js generate --prompt "A cinematic fox warrior, ultra detailed"
   node scripts/chatgpt-image.js generate --prompt "Use the uploaded image as reference" --reference .\\ref.png
+  node scripts/chatgpt-image.js generate --prompt "cat" --project "LY"
 
 Notes:
   1. "launch" starts your local Chrome with remote debugging enabled on port ${DEBUG_PORT}.
@@ -190,6 +193,8 @@ async function generateImage(options) {
   const maxTextRetries = Number(options["text-retries"] || DEFAULT_MAX_TEXT_RETRIES);
   const cdpUrl = resolveCdpUrl(options);
   const referencePaths = resolveReferencePaths(options);
+  const projectName = resolveImageProjectName(options);
+  const projectTimeoutMs = Number(options["project-timeout"] || 60000);
 
   fs.mkdirSync(outputDir, { recursive: true });
 
@@ -231,6 +236,10 @@ async function generateImage(options) {
             throw new Error(`Generated image failed quality validation: ${result.failures.join("; ")}`);
           }
         }
+        if (projectName) {
+          await moveCurrentChatToProject(page, projectName, projectTimeoutMs);
+          console.log(`Moved chat to project: ${projectName}`);
+        }
         return;
       } catch (error) {
         if (error && error.code === "TEXT_ONLY_RESPONSE" && attempt < maxTextRetries) {
@@ -261,6 +270,14 @@ function buildAttemptPrompt(prompt, attempt) {
 
   const content = prompt.startsWith(IMAGE_PROMPT_PREFIX) ? prompt.slice(IMAGE_PROMPT_PREFIX.length) : prompt;
   return `${IMAGE_PROMPT_PREFIX}请直接生成一张图片，不要回复文字说明，不要询问，不要解释。画面内容：${content}`;
+}
+
+function resolveImageProjectName(options) {
+  if (options["no-project"]) return "";
+  if (typeof options.project === "string" && options.project.trim()) {
+    return options.project.trim();
+  }
+  return DEFAULT_IMAGE_PROJECT;
 }
 
 function resolveReferencePaths(options) {
@@ -671,18 +688,93 @@ async function isUploadBusy(page) {
   }).catch(() => false);
 }
 
-async function submitPrompt(page, prompt) {
-  const editable = page.locator('[contenteditable="true"][role="textbox"], [contenteditable="true"]').first();
-  const textbox = page.locator('textarea').first();
+async function moveCurrentChatToProject(page, projectName, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  await closeOpenMenus(page);
 
-  if (await isActuallyVisible(editable)) {
-    await fillComposer(editable, page, prompt);
-    await sendComposer(page);
-    return;
+  const optionsButton = page.locator('[data-testid="conversation-options-button"]').last();
+  if (!await optionsButton.count()) {
+    throw new Error("Could not find ChatGPT conversation options button.");
+  }
+  await optionsButton.click();
+
+  await waitUntil(deadline, async () => {
+    return await clickMenuItemByText(page, ["Move to project", "移至项目"], { hover: true, click: true });
+  }, `Could not open "Move to project" menu.`);
+
+  await page.waitForTimeout(500);
+  const clickedProject = await waitUntil(deadline, async () => {
+    return await clickProjectMenuItem(page, projectName);
+  }, `Project not found in ChatGPT project menu: ${projectName}`);
+
+  if (!clickedProject) {
+    throw new Error(`Project not found in ChatGPT project menu: ${projectName}`);
   }
 
-  if (await isActuallyVisible(textbox)) {
-    await fillComposer(textbox, page, prompt);
+  await page.waitForTimeout(2000);
+}
+
+async function closeOpenMenus(page) {
+  await page.keyboard.press("Escape").catch(() => {});
+  await page.waitForTimeout(200).catch(() => {});
+}
+
+async function waitUntil(deadline, action, message) {
+  while (Date.now() < deadline) {
+    if (await action()) return true;
+    await sleep(500);
+  }
+  throw new Error(message);
+}
+
+async function clickMenuItemByText(page, labels, options = {}) {
+  return page.evaluate(({ labels, hover, click }) => {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const candidates = Array.from(document.querySelectorAll('[role="menuitem"], button, a'));
+    const item = candidates.find((element) => {
+      const text = normalize([
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-testid"),
+        element.getAttribute("title"),
+      ].filter(Boolean).join(" "));
+      return labels.some((label) => text.includes(label));
+    });
+    if (!item) return false;
+    if (hover) item.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
+    if (click) item.click();
+    return true;
+  }, { labels, hover: Boolean(options.hover), click: Boolean(options.click) }).catch(() => false);
+}
+
+async function clickProjectMenuItem(page, projectName) {
+  return page.evaluate((projectName) => {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const candidates = Array.from(document.querySelectorAll('[role="menuitem"], a, button'));
+    const item = candidates.find((element) => {
+      const text = normalize([
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("title"),
+      ].filter(Boolean).join(" "));
+      if (!text) return false;
+      const tokens = Array.from(new Set(text.split(" ").filter(Boolean)));
+      return text === projectName || tokens.includes(projectName) || text.includes(projectName);
+    });
+    if (!item) return false;
+    item.click();
+    return true;
+  }, projectName).catch(() => false);
+}
+
+async function submitPrompt(page, prompt) {
+  if (await insertPromptIntoComposer(page, prompt)) {
+    const actualText = await readComposerText(page);
+    if (!actualText.includes(prompt)) {
+      throw new Error(`Composer text verification failed. Expected full prompt, got: ${actualText}`);
+    }
     await sendComposer(page);
     return;
   }
@@ -695,11 +787,52 @@ async function isActuallyVisible(locator) {
     return false;
   }
 
+  const box = await locator.boundingBox().catch(() => null);
+  if (!box || box.width <= 0 || box.height <= 0) {
+    return false;
+  }
+
   return locator.evaluate((element) => {
     const rect = element.getBoundingClientRect();
     const style = window.getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden";
+    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
   }).catch(() => false);
+}
+
+async function insertPromptIntoComposer(page, prompt) {
+  const selectors = [
+    "div#prompt-textarea",
+    '[contenteditable="true"][role="textbox"]',
+    '[contenteditable="true"]',
+    "textarea",
+  ];
+  for (const selector of selectors) {
+    const target = await findVisibleElementHandle(page, selector);
+    if (!target) continue;
+    const box = await target.boundingBox().catch(() => null);
+    if (!box || box.width <= 0 || box.height <= 0) continue;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    await page.keyboard.press("Control+A");
+    await page.keyboard.press("Backspace");
+    await page.keyboard.insertText(prompt);
+    await page.waitForTimeout(300);
+    return true;
+  }
+  return false;
+}
+
+async function findVisibleElementHandle(page, selector) {
+  const handles = await page.$$(selector);
+  for (const handle of handles) {
+    const visible = await handle.evaluate((element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+    }).catch(() => false);
+    if (visible) return handle;
+    await handle.dispose().catch(() => {});
+  }
+  return null;
 }
 
 async function fillComposer(locator, page, prompt) {

@@ -51,7 +51,7 @@ http://127.0.0.1:9222
 生成一张图片：
 
 ```powershell
-npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --new-chat --validate
+npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --project "LY" --new-chat --validate
 ```
 
 脚本会自动把图片提示词规范成：
@@ -61,6 +61,24 @@ npm run chatgpt:image -- --prompt "cat" --output output\chatgpt-images --new-cha
 ```
 
 如果 ChatGPT 返回文字而不是图片，脚本会延时检测并尝试用更强的图片生成提示词重试。
+
+图片聊天默认强制移动到 ChatGPT 项目，避免生成很多散落聊天。项目名优先级：
+
+1. `--project "项目名"`
+2. 环境变量 `CHATGPT_IMAGE_PROJECT`
+3. 默认值 `Codex 图片生成`
+
+如果项目不存在或移动失败，图片已经下载后脚本仍会退出失败。临时关闭项目移动：
+
+```powershell
+node scripts\chatgpt-image.js generate --prompt "cat" --no-project
+```
+
+建议先在 ChatGPT 网页里创建一个固定项目，然后设置：
+
+```powershell
+$env:CHATGPT_IMAGE_PROJECT="LY"
+```
 
 可选上传参考图：
 
