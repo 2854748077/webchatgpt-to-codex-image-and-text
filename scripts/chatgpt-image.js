@@ -10,7 +10,7 @@ const { chromium } = require("playwright");
 const DEBUG_PORT = Number(process.env.CHROME_DEBUG_PORT || 9222);
 const CHATGPT_URL = "https://chatgpt.com/";
 const DEFAULT_OUTPUT_DIR = path.resolve(process.cwd(), "output", "chatgpt-images");
-const DEFAULT_CHROME_USER_DATA_DIR = path.resolve(process.cwd(), "output", "chrome-automation-profile");
+const DEFAULT_CHROME_USER_DATA_DIR = getSystemChromeUserDataDir();
 const DEFAULT_TIMEOUT_MS = 8 * 60 * 1000;
 const IMAGE_PROMPT_PREFIX = "生成照片：";
 const DEFAULT_TEXT_RETRY_DELAY_MS = 60 * 1000;
@@ -35,6 +35,11 @@ async function main() {
     return;
   }
 
+  if (command === "move-project" || command === "move-to-project") {
+    await moveCurrentChatCommand(parseOptions(args));
+    return;
+  }
+
   if (command === "check") {
     await checkDebugger(parseOptions(args));
     return;
@@ -55,6 +60,7 @@ Usage:
                                        [--user-data-dir ./output/chrome-automation-profile] [--system-profile]
   node scripts/chatgpt-image.js check [--cdp-url http://127.0.0.1:9222] [--port 9222]
   node scripts/chatgpt-image.js validate --image ./output/chatgpt-images/example.png
+  node scripts/chatgpt-image.js move-project --project "333" [--cdp-url http://127.0.0.1:9222] [--port 9222]
   node scripts/chatgpt-image.js generate --prompt "your prompt" [--output ./output/chatgpt-images]
                                      [--timeout 480000] [--cdp-url http://127.0.0.1:9222] [--port 9222]
                                      [--reference ./ref.png] [--references ./refs.txt]
@@ -65,17 +71,19 @@ Examples:
   node scripts/chatgpt-image.js launch
   node scripts/chatgpt-image.js check
   node scripts/chatgpt-image.js check --cdp-url http://127.0.0.1:9222
+  node scripts/chatgpt-image.js move-project --project "333"
   node scripts/chatgpt-image.js generate --prompt "A cinematic fox warrior, ultra detailed"
   node scripts/chatgpt-image.js generate --prompt "Use the uploaded image as reference" --reference .\\ref.png
   node scripts/chatgpt-image.js generate --prompt "cat" --project "333"
 
 Notes:
   1. "launch" starts your local Chrome with remote debugging enabled on port ${DEBUG_PORT}.
-  2. By default it uses an isolated Chrome user data dir at ${DEFAULT_CHROME_USER_DATA_DIR}.
-  3. This avoids the common Windows issue where your daily Chrome instance ignores the debug flags.
-  4. Use --system-profile only if you explicitly want your normal Chrome profile and can fully close Chrome first.
+  2. By default it uses your system Chrome profile at ${DEFAULT_CHROME_USER_DATA_DIR}.
+  3. Fully close Chrome first, or use --force-close, so Chrome accepts the remote debugging flags.
+  4. Use --user-data-dir if you explicitly want an isolated automation profile.
   5. "check" only verifies that an existing CDP endpoint is reachable.
-  6. "generate" prefers an already-open ChatGPT tab, then saves the first generated image.
+  6. "generate" prefers an already-open ChatGPT conversation tab, then any ChatGPT tab.
+  7. Pass --new-chat only when you want a separate new ChatGPT tab for the generation.
 `);
 }
 
@@ -130,7 +138,7 @@ async function launchChrome(options) {
   const startUrl = String(options.url || CHATGPT_URL);
   const forceClose = Boolean(options["force-close"]);
 
-  if (Boolean(options["system-profile"]) && !fs.existsSync(userDataDir)) {
+  if (!fs.existsSync(userDataDir) && (Boolean(options["system-profile"]) || userDataDir === getSystemChromeUserDataDir())) {
     throw new Error(`Chrome user data dir not found: ${userDataDir}`);
   }
 
@@ -178,7 +186,7 @@ function resolveChromeUserDataDir(options) {
     return getSystemChromeUserDataDir();
   }
 
-  return DEFAULT_CHROME_USER_DATA_DIR;
+  return getSystemChromeUserDataDir();
 }
 
 async function generateImage(options) {
@@ -203,10 +211,10 @@ async function generateImage(options) {
 
   const browser = await chromium.connectOverCDP(cdpUrl);
   try {
-    const page = await resolvePage(browser);
+    let page = await resolvePage(browser);
     for (let attempt = 0; attempt <= maxTextRetries; attempt += 1) {
       if (options["new-chat"] || attempt > 0) {
-        await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded" });
+        page = await openNewChatTab(browser);
       }
       await ensureChatGptPage(page);
       await ensureReady(page, timeoutMs);
@@ -223,12 +231,12 @@ async function generateImage(options) {
       await submitPrompt(page, attemptPrompt);
 
       try {
-        const imageHandle = await waitForGeneratedImage(page, baselineKeys, timeoutMs, {
+        const imageRef = await waitForGeneratedImage(page, baselineKeys, timeoutMs, {
           baselineAssistantImages,
           baselineText,
           textRetryDelayMs,
         });
-        const savedPath = await saveImage(imageHandle, outputDir);
+        const savedPath = await saveImage(page, imageRef, outputDir);
         console.log(`Saved image: ${savedPath}`);
         if (options.validate) {
           const result = validateImageFile(savedPath, options);
@@ -250,6 +258,31 @@ async function generateImage(options) {
         throw error;
       }
     }
+  } finally {
+    await browser.close();
+  }
+}
+
+async function moveCurrentChatCommand(options) {
+  const projectName = String(options.project || options.to || "").trim();
+  if (!projectName) {
+    throw new Error('Missing required argument: --project "333"');
+  }
+
+  const cdpUrl = resolveCdpUrl(options);
+  const projectTimeoutMs = Number(options["project-timeout"] || 60000);
+  await assertDebuggerReachable(cdpUrl);
+
+  const browser = await chromium.connectOverCDP(cdpUrl);
+  try {
+    const page = await resolveConversationPage(browser);
+    await ensureChatGptPage(page);
+    const movedProject = await moveCurrentChatToProject(page, {
+      enabled: true,
+      candidates: [projectName],
+      createName: projectName,
+    }, projectTimeoutMs);
+    console.log(`Moved chat to project: ${movedProject}`);
   } finally {
     await browser.close();
   }
@@ -396,7 +429,12 @@ async function resolvePage(browser) {
   }
 
   const context = contexts[0];
-  const pages = context.pages();
+  const pages = context.pages().filter((page) => !page.isClosed());
+
+  const existingConversationPage = await findBestChatGptConversationPage(pages);
+  if (existingConversationPage) {
+    return existingConversationPage;
+  }
 
   const activeChatgptPage = await findBestChatGptPage(pages);
   if (activeChatgptPage) {
@@ -413,6 +451,43 @@ async function resolvePage(browser) {
   }
 
   return await context.newPage();
+}
+
+async function openNewChatTab(browser) {
+  const contexts = browser.contexts();
+  if (contexts.length === 0) {
+    throw new Error("No Chrome context found via CDP.");
+  }
+  const page = await contexts[0].newPage();
+  await page.goto(CHATGPT_URL, { waitUntil: "domcontentloaded" });
+  return page;
+}
+
+async function resolveConversationPage(browser) {
+  const contexts = browser.contexts();
+  if (contexts.length === 0) {
+    throw new Error("No Chrome context found via CDP.");
+  }
+
+  const pages = contexts[0].pages().filter((page) => !page.isClosed());
+  for (const page of pages) {
+    const state = await page.evaluate(() => {
+      return {
+        focused: document.hasFocus(),
+        visible: document.visibilityState === "visible",
+        url: window.location.href,
+      };
+    }).catch(() => null);
+    if (state && isChatGptConversationUrl(state.url)) {
+      return page;
+    }
+  }
+
+  const page = await resolvePage(browser);
+  if (!isChatGptConversationUrl(page.url())) {
+    throw new Error("No active ChatGPT conversation tab found. Open the target conversation first.");
+  }
+  return page;
 }
 
 async function ensureChatGptPage(page) {
@@ -444,6 +519,35 @@ async function findBestChatGptPage(pages) {
     }
 
     const score = (state.focused ? 2 : 0) + (state.visible ? 1 : 0);
+    if (!best || score > best.score) {
+      best = { page, score };
+    }
+  }
+
+  return best ? best.page : null;
+}
+
+async function findBestChatGptConversationPage(pages) {
+  let best = null;
+
+  for (const page of pages) {
+    if (page.isClosed()) {
+      continue;
+    }
+
+    const state = await page.evaluate(() => {
+      return {
+        focused: document.hasFocus(),
+        visible: document.visibilityState === "visible",
+        url: window.location.href,
+      };
+    }).catch(() => null);
+
+    if (!state || !isChatGptConversationUrl(state.url)) {
+      continue;
+    }
+
+    const score = (state.focused ? 4 : 0) + (state.visible ? 2 : 0);
     if (!best || score > best.score) {
       best = { page, score };
     }
@@ -486,22 +590,19 @@ async function findActivePage(pages) {
 }
 
 async function ensureReady(page, timeoutMs) {
-  const selectors = [
-    'textarea',
-    '[contenteditable="true"]',
-    '[data-testid="composer-text-input"]',
-  ];
-
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    for (const selector of selectors) {
-      const locator = page.locator(selector).first();
-      if (await locator.count()) {
-        await locator.waitFor({ state: "visible", timeout: 2000 }).catch(() => {});
-        if (await locator.isVisible().catch(() => false)) {
-          return;
-        }
-      }
+    const ready = await page.evaluate(() => {
+      const visible = (element) => {
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+      };
+      return Array.from(document.querySelectorAll("textarea, [contenteditable='true'], [data-testid='composer-text-input']"))
+        .some((element) => visible(element) && !element.disabled && element.getAttribute("aria-disabled") !== "true");
+    }).catch(() => false);
+    if (ready) {
+      return;
     }
 
     if (Date.now() > deadline) {
@@ -560,27 +661,24 @@ async function uploadReferenceImages(page, referencePaths, timeoutMs) {
 }
 
 async function findFileInput(page) {
-  const handles = [];
-  const selectors = [
-    'input#upload-photos[type="file"]',
-    'input#image-gen-action-modal-upload-photos[type="file"]',
-    'input[type="file"][accept*="image"]',
-    'input[type="file"]',
-  ];
-  for (const selector of selectors) {
-    for (const handle of await page.$$(selector)) {
-      if (!handles.includes(handle)) handles.push(handle);
-    }
-  }
-  for (const handle of handles) {
-    const acceptsImage = await handle.evaluate((input) => {
+  const handle = await page.evaluateHandle(() => {
+    const selectors = [
+      'input#upload-photos[type="file"]',
+      'input#image-gen-action-modal-upload-photos[type="file"]',
+      'input[type="file"][accept*="image"]',
+      'input[type="file"]',
+    ];
+    const inputs = selectors.flatMap((selector) => Array.from(document.querySelectorAll(selector)));
+    return inputs.find((input) => {
       const accept = String(input.getAttribute("accept") || "").toLowerCase();
       return !accept || accept.includes("image") || accept.includes(".png") || accept.includes(".jpg") || accept.includes(".jpeg") || accept.includes(".webp");
-    }).catch(() => false);
-    if (acceptsImage) return handle;
-    await handle.dispose().catch(() => {});
+    }) || null;
+  }).catch(() => null);
+  const element = handle ? handle.asElement() : null;
+  if (!element) {
+    await handle?.dispose().catch(() => {});
   }
-  return null;
+  return element;
 }
 
 async function activateImageGenerationMode(page) {
@@ -622,25 +720,10 @@ async function openFileChooser(page, timeoutMs) {
 }
 
 async function clickUploadButton(page) {
-  const selectors = [
-    '[data-testid="composer-plus-btn"]',
-    'button[data-testid*="plus"]',
-    'button[aria-label*="Attach"]',
-    'button[aria-label*="Upload"]',
-    'button[aria-label*="Add"]',
-    'button[aria-label*="添加"]',
-    'button[aria-label*="上传"]',
-    'button[aria-label*="附件"]',
-  ];
+  return clickUploadButtonViaDom(page);
+}
 
-  for (const selector of selectors) {
-    const button = page.locator(selector).last();
-    if (await button.count() && await button.isVisible().catch(() => false) && await button.isEnabled().catch(() => false)) {
-      await button.click();
-      return true;
-    }
-  }
-
+async function clickUploadButtonViaDom(page) {
   return page.evaluate(() => {
     const visible = (element) => {
       const rect = element.getBoundingClientRect();
@@ -661,7 +744,7 @@ async function clickUploadButton(page) {
         const rect = button.getBoundingClientRect();
         return { button, text, rect };
       })
-      .filter((item) => /attach|upload|add|plus|paperclip|添加|上传|附件|文件/i.test(item.text))
+      .filter((item) => /attach|upload|add|plus|paperclip|添加|上传|附件|文件|娣诲姞|涓婁紶|闄勪欢|鏂囦欢/i.test(item.text))
       .sort((a, b) => (b.rect.y - a.rect.y) || (a.rect.x - b.rect.x))[0];
     if (!candidate) return false;
     candidate.button.click();
@@ -715,6 +798,9 @@ async function moveCurrentChatToProject(page, projectPlan, timeoutMs) {
     const result = await clickProjectMenuItem(page, projectName);
     if (result.clicked) {
       await page.waitForTimeout(2000);
+      if (!result.href && page.url().includes("/project")) {
+        result.href = page.url();
+      }
       await verifyChatInProject(page, {
         chatId,
         projectName,
@@ -734,13 +820,12 @@ async function moveCurrentChatToProject(page, projectPlan, timeoutMs) {
 }
 
 async function openMoveToProjectMenu(page, deadline) {
-  const optionsButton = page.locator('[data-testid="conversation-options-button"]').last();
-  if (!await optionsButton.count()) {
-    throw new Error("Could not find ChatGPT conversation options button.");
-  }
-  await optionsButton.click();
+  await waitUntil(deadline, async () => clickConversationOptionsButton(page), "Could not find ChatGPT conversation options button.");
 
   await waitUntil(deadline, async () => {
+    if (await clickMenuItemByText(page, ["Move to project", "\u79fb\u81f3\u9879\u76ee"], { hover: true, click: true })) {
+      return true;
+    }
     return await clickMenuItemByText(page, ["Move to project", "移至项目"], { hover: true, click: true });
   }, `Could not open "Move to project" menu.`);
 
@@ -748,9 +833,13 @@ async function openMoveToProjectMenu(page, deadline) {
 }
 
 async function createProjectFromMoveMenu(page, projectName, deadline) {
+  const openedPreferred = await clickProjectMenuItem(page, "\u65b0\u9879\u76ee");
+  if (openedPreferred.clicked) {
+    await page.waitForTimeout(500);
+  }
   const openedResult = await clickProjectMenuItem(page, "新项目");
   const openedFallback = openedResult.clicked ? openedResult : await clickProjectMenuItem(page, "New project");
-  const opened = openedFallback.clicked;
+  const opened = openedPreferred.clicked || openedFallback.clicked;
   if (!opened) {
     throw new Error(`Projects not found and could not open new project flow for: ${projectName}`);
   }
@@ -760,6 +849,9 @@ async function createProjectFromMoveMenu(page, projectName, deadline) {
   }, `Could not find new project name field for: ${projectName}`);
 
   await waitUntil(deadline, async () => {
+    if (await clickMenuItemByText(page, ["Create project", "Create", "\u521b\u5efa\u9879\u76ee", "\u521b\u5efa"], { click: true })) {
+      return true;
+    }
     return await clickMenuItemByText(page, ["Create project", "Create", "创建项目", "创建"], { click: true });
   }, `Could not create ChatGPT project: ${projectName}`);
 
@@ -771,9 +863,36 @@ function extractConversationId(url) {
   return match ? match[1] : "";
 }
 
+function isChatGptConversationUrl(url) {
+  return String(url || "").includes("chatgpt.com/") && /\/c\/[^/?#]+/.test(String(url || ""));
+}
+
 async function closeOpenMenus(page) {
-  await page.keyboard.press("Escape").catch(() => {});
+  await page.evaluate(() => {
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+    document.dispatchEvent(new KeyboardEvent("keyup", { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+  }).catch(() => {});
   await page.waitForTimeout(200).catch(() => {});
+}
+
+async function clickConversationOptionsButton(page) {
+  return page.evaluate(() => {
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim();
+    const labels = ["Open conversation options", "\u6253\u5f00\u5bf9\u8bdd\u9009\u9879"];
+    const button = Array.from(document.querySelectorAll("button")).find((element) => {
+      const text = normalize([
+        element.innerText,
+        element.textContent,
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-testid"),
+        element.getAttribute("title"),
+      ].filter(Boolean).join(" "));
+      return labels.some((label) => text.includes(label));
+    });
+    if (!button) return false;
+    button.click();
+    return true;
+  }).catch(() => false);
 }
 
 async function waitUntil(deadline, action, message) {
@@ -828,7 +947,8 @@ async function clickProjectMenuItem(page, projectName) {
       return text === projectName || tokens.includes(projectName) || text.includes(projectName);
     });
     if (!item) return { clicked: false, href: "" };
-    const href = item.element.href || item.element.getAttribute("href") || "";
+    const link = item.element.matches("a") ? item.element : item.element.closest("a") || item.element.querySelector("a");
+    const href = (link && (link.href || link.getAttribute("href"))) || item.element.href || item.element.getAttribute("href") || "";
     item.element.click();
     return { clicked: true, href };
   }, projectName).catch(() => ({ clicked: false, href: "" }));
@@ -853,14 +973,21 @@ async function verifyChatInProject(page, details) {
 }
 
 async function fillProjectNameField(page, projectName) {
-  const input = await findVisibleElementHandle(page, 'input[type="text"], input:not([type]), textarea');
-  if (!input) return false;
-  const box = await input.boundingBox().catch(() => null);
-  if (!box || box.width <= 0 || box.height <= 0) return false;
-  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Backspace");
-  await page.keyboard.insertText(projectName);
+  const filled = await page.evaluate((value) => {
+    const visible = (element) => {
+      const rect = element.getBoundingClientRect();
+      const style = window.getComputedStyle(element);
+      return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
+    };
+    const input = Array.from(document.querySelectorAll('input[type="text"], input:not([type]), textarea')).find(visible);
+    if (!input) return false;
+    input.focus();
+    input.value = value;
+    input.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }, projectName).catch(() => false);
+  if (!filled) return false;
   await page.waitForTimeout(300);
   return true;
 }
@@ -878,69 +1005,43 @@ async function submitPrompt(page, prompt) {
   throw new Error("Could not find a writable ChatGPT input box.");
 }
 
-async function isActuallyVisible(locator) {
-  if (!await locator.count()) {
-    return false;
-  }
-
-  const box = await locator.boundingBox().catch(() => null);
-  if (!box || box.width <= 0 || box.height <= 0) {
-    return false;
-  }
-
-  return locator.evaluate((element) => {
-    const rect = element.getBoundingClientRect();
-    const style = window.getComputedStyle(element);
-    return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
-  }).catch(() => false);
-}
-
 async function insertPromptIntoComposer(page, prompt) {
-  const selectors = [
-    "div#prompt-textarea",
-    '[contenteditable="true"][role="textbox"]',
-    '[contenteditable="true"]',
-    "textarea",
-  ];
-  for (const selector of selectors) {
-    const target = await findVisibleElementHandle(page, selector);
-    if (!target) continue;
-    const box = await target.boundingBox().catch(() => null);
-    if (!box || box.width <= 0 || box.height <= 0) continue;
-    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
-    await page.keyboard.press("Control+A");
-    await page.keyboard.press("Backspace");
-    await page.keyboard.insertText(prompt);
-    await page.waitForTimeout(300);
-    return true;
-  }
-  return false;
-}
-
-async function findVisibleElementHandle(page, selector) {
-  const handles = await page.$$(selector);
-  for (const handle of handles) {
-    const visible = await handle.evaluate((element) => {
+  const inserted = await page.evaluate((value) => {
+    const visible = (element) => {
       const rect = element.getBoundingClientRect();
       const style = window.getComputedStyle(element);
       return rect.width > 0 && rect.height > 0 && style.display !== "none" && style.visibility !== "hidden" && style.opacity !== "0";
-    }).catch(() => false);
-    if (visible) return handle;
-    await handle.dispose().catch(() => {});
-  }
-  return null;
-}
+    };
+    const selectors = [
+      "div#prompt-textarea",
+      "[contenteditable='true'][role='textbox']",
+      "[contenteditable='true']",
+      "textarea",
+    ];
+    const target = selectors
+      .flatMap((selector) => Array.from(document.querySelectorAll(selector)))
+      .find((element, index, elements) => visible(element) && elements.indexOf(element) === index);
+    if (!target) return false;
 
-async function fillComposer(locator, page, prompt) {
-  await locator.click();
-  await page.keyboard.press("Control+A");
-  await page.keyboard.press("Backspace");
-  await page.keyboard.insertText(prompt);
+    target.focus();
+    if (target.tagName === "TEXTAREA" || target.tagName === "INPUT") {
+      target.value = value;
+      target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+      target.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    }
+
+    target.textContent = "";
+    const paragraph = document.createElement("p");
+    paragraph.textContent = value;
+    target.appendChild(paragraph);
+    target.dispatchEvent(new InputEvent("input", { bubbles: true, inputType: "insertText", data: value }));
+    target.dispatchEvent(new Event("change", { bubbles: true }));
+    return true;
+  }, prompt).catch(() => false);
+  if (!inserted) return false;
   await page.waitForTimeout(300);
-  const actualText = await readComposerText(page);
-  if (!actualText.includes(prompt)) {
-    throw new Error(`Composer text verification failed. Expected full prompt, got: ${actualText}`);
-  }
+  return true;
 }
 
 async function readComposerText(page) {
@@ -971,40 +1072,16 @@ async function sendComposer(page) {
     return;
   }
 
-  await page.keyboard.press("Control+Enter").catch(() => {});
-  if (await waitForComposerSubmitted(page, 3000).catch(() => false)) {
-    return;
-  }
-
-  await page.keyboard.press("Enter").catch(() => {});
-  if (await waitForComposerSubmitted(page, 3000).catch(() => false)) {
-    return;
-  }
-
   throw new Error("Prompt was filled, but the ChatGPT send button could not be clicked.");
 }
 
 async function clickSendButton(page) {
-  const selectors = [
-    '[data-testid="send-button"]',
-    '[data-testid="composer-submit-button"]',
-    'button[data-testid*="send"]',
-    'button[data-testid*="submit"]',
-    'button[aria-label*="Send"]',
-    'button[aria-label*="发送"]',
-    'button[aria-label*="提交"]',
-  ];
+  return clickSendButtonViaDom(page);
+}
 
+async function clickSendButtonViaDom(page) {
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
-    for (const selector of selectors) {
-      const button = page.locator(selector).last();
-      if (await button.count() && await button.isVisible().catch(() => false) && await button.isEnabled().catch(() => false)) {
-        await button.click();
-        return true;
-      }
-    }
-
     const clicked = await page.evaluate(() => {
       const isVisible = (element) => {
         const rect = element.getBoundingClientRect();
@@ -1026,24 +1103,17 @@ async function clickSendButton(page) {
           const rect = button.getBoundingClientRect();
           return { button, text, rect };
         })
-        .filter((item) => /send|submit|发送|提交|arrow-up|向上/i.test(item.text))
+        .filter((item) => /send|submit|发送|提交|arrow-up|向上|鍙戦€亅鎻愰交|鎻愪氦|鍚戜笂/i.test(item.text))
         .sort((a, b) => (b.rect.y - a.rect.y) || (b.rect.x - a.rect.x));
 
-      if (!candidates[0]) {
-        return false;
-      }
-
+      if (!candidates[0]) return false;
       candidates[0].button.click();
       return true;
     }).catch(() => false);
 
-    if (clicked) {
-      return true;
-    }
-
+    if (clicked) return true;
     await page.waitForTimeout(300);
   }
-
   return false;
 }
 
@@ -1087,7 +1157,8 @@ async function waitForGeneratedImage(page, baselineKeys, timeoutMs, options = {}
   let stableSince = 0;
 
   while (Date.now() < deadline) {
-    const candidates = await page.locator("img").evaluateAll((nodes, payload) => {
+    const candidates = await page.evaluate((payload) => {
+      const nodes = Array.from(document.querySelectorAll("img"));
       const baseline = payload.baseline || [];
       const assistantBaseline = payload.assistantBaseline || { count: 0, keys: [] };
       const assistantNodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
@@ -1142,7 +1213,7 @@ async function waitForGeneratedImage(page, baselineKeys, timeoutMs, options = {}
         stableCandidate = best;
         stableSince = Date.now();
       } else if (Date.now() - stableSince >= 3000) {
-        return page.locator("img").nth(best.index);
+        return best;
       }
     }
 
@@ -1189,14 +1260,14 @@ async function hasTextOnlyResponse(page, baselineText) {
   }, baselineText).catch(() => false);
 }
 
-async function saveImage(imageLocator, outputDir) {
+async function saveImage(page, imageRef, outputDir) {
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
   const baseName = `chatgpt-image-${timestamp}`;
-  const src = await imageLocator.evaluate((img) => img.currentSrc || img.src || "");
+  const src = imageRef && imageRef.src ? imageRef.src : "";
 
   if (src) {
-    const base64 = await imageLocator.evaluate(async (img) => {
-      const response = await fetch(img.currentSrc || img.src);
+    const base64 = await page.evaluate(async (targetSrc) => {
+      const response = await fetch(targetSrc);
       const blob = await response.blob();
       const buffer = await blob.arrayBuffer();
       let binary = "";
@@ -1205,7 +1276,7 @@ async function saveImage(imageLocator, outputDir) {
         binary += String.fromCharCode(byte);
       }
       return btoa(binary);
-    }).catch(() => null);
+    }, src).catch(() => null);
 
     if (base64) {
       const buffer = Buffer.from(base64, "base64");
@@ -1217,7 +1288,22 @@ async function saveImage(imageLocator, outputDir) {
   }
 
   const filePath = path.join(outputDir, `${baseName}.png`);
-  await imageLocator.screenshot({ path: filePath });
+  const screenshotBase64 = await page.evaluate(async (target) => {
+    const images = Array.from(document.querySelectorAll("img"));
+    const img = images[target.index] || images.find((node) => (node.currentSrc || node.src || "") === target.src);
+    if (!img) return "";
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth || img.width;
+    canvas.height = img.naturalHeight || img.height;
+    const ctx = canvas.getContext("2d");
+    if (!ctx || !canvas.width || !canvas.height) return "";
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas.toDataURL("image/png").split(",")[1] || "";
+  }, imageRef || {}).catch(() => "");
+  if (!screenshotBase64) {
+    throw new Error("Could not save generated image from the page DOM.");
+  }
+  fs.writeFileSync(filePath, Buffer.from(screenshotBase64, "base64"));
   return filePath;
 }
 
